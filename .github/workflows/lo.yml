@@ -1,0 +1,141 @@
+name: release
+
+# Builds native installers for macOS (Intel + Apple Silicon), Windows x64,
+# and Linux x64, then uploads every installer to the GitHub Release that
+# triggered the run. Also runnable manually (workflow_dispatch) for a dry
+# run that uploads workflow artifacts instead of touching a release.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            platform: macos-latest
+            rust_target: aarch64-apple-darwin
+          - name: macos-x64
+            platform: macos-latest
+            rust_target: x86_64-apple-darwin
+          - name: windows-x64
+            platform: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+          - name: linux-x64
+            platform: ubuntu-22.04
+            rust_target: x86_64-unknown-linux-gnu
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libgtk-3-dev
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # `npm ci` requires package-lock.json to exist and refuses to run
+      # without it (by design -- that strictness is the whole point of
+      # `ci` over `install`). Rather than relaxing that guarantee, this
+      # step regenerates the lockfile when it's missing, using
+      # --package-lock-only so it only writes package-lock.json and never
+      # touches node_modules or any application source. After this step,
+      # package-lock.json always exists, so `npm ci` below always has
+      # what it needs and never fails for this reason.
+      - name: Ensure package-lock.json exists
+        shell: bash
+        run: |
+          if [ ! -f package-lock.json ]; then
+            echo "package-lock.json not found -- generating it from package.json"
+            npm install --package-lock-only --no-audit --no-fund
+          else
+            echo "package-lock.json found"
+          fi
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build and publish Tauri app (${{ matrix.name }})
+        id: tauri-action
+        if: github.event_name == 'release'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --target ${{ matrix.rust_target }}
+          # releaseId pins this upload to the exact release that triggered
+          # the workflow run. tauri-action's own docs note that when
+          # releaseId is set, tagName/releaseName are not consulted, so
+          # there's no need (or value) in passing them alongside it.
+          releaseId: ${{ github.event.release.id }}
+          includeUpdaterJson: false
+
+      - name: Build only, no publish (manual run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --target ${{ matrix.rust_target }}
+
+      - name: Collect build artifacts (manual run)
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGING_DIR="dist-staging"
+          mkdir -p "$STAGING_DIR"
+          BUNDLE_DIR="src-tauri/target/${{ matrix.rust_target }}/release/bundle"
+
+          shopt -s nullglob globstar
+          for f in "$BUNDLE_DIR"/**/*.exe "$BUNDLE_DIR"/**/*.dmg "$BUNDLE_DIR"/**/*.deb "$BUNDLE_DIR"/**/*.AppImage "$BUNDLE_DIR"/**/*.rpm; do
+            [ -e "$f" ] && cp "$f" "$STAGING_DIR/"
+          done
+
+          ls -la "$STAGING_DIR"
+
+      - name: Upload workflow artifacts (manual run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImageConverterPro-${{ matrix.name }}
+          path: dist-staging/*
+          if-no-files-found: error
